@@ -1,0 +1,24 @@
+# Dependencies & build output
+node_modules
+dist
+dist-ssr
+
+# Local settings (copy .env.example to .env)
+.env
+firmware/smartchip_esp32/secrets.h
+tools/serviceAccount.json
+.env.local
+*.local
+
+# Logs
+logs
+*.log
+firebase-debug.log*
+firestore-debug.log*
+npm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

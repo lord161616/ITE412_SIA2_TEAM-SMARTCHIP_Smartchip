@@ -1,0 +1,12 @@
+{
+  "name": "smartchip-tools",
+  "private": true,
+  "type": "module",
+  "description": "One-off admin scripts (run on your PC, not deployed).",
+  "scripts": {
+    "import-runs": "node import-past-runs.mjs"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.6.0"
+  }
+}

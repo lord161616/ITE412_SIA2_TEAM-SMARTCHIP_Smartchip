@@ -1,0 +1,681 @@
+rules_version = '2';
+
+// =====================================================================
+// SmartChip Firestore security rules (data model v2)
+// Field-by-field contract: docs/DATA_MODEL.md
+//
+//   anyone         read shop settings + published listings
+//   customer       own profile, reserve, pay, cancel own reservations
+//   viewer         read devices / runs / inventory
+//   operator       viewer + send commands, manage inventory, run the shop
+//   administrator  operator + users, archive batches
+//   ESP32          signs in with the device account in isDevice()
+//
+// Ownership rule: on devices/{id} the ESP32 writes everything EXCEPT
+// `command`; operators write ONLY `command` (plus offline recovery).
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------
+    // Who is calling
+    // ---------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // >>> SETUP: put the Firebase Auth UID of the ESP32's account here
+    //     (Firebase console > Authentication > Users). See SETUP.md.
+    function isDevice() {
+      return signedIn() && request.auth.uid in [
+        "z2GsVcpgerXNvcXMmsEnmIzgyGG2"
+        
+      ];
+    }
+
+    function me() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isActiveStaff(roles) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().get("status", "") == "active"
+        && me().get("accountType", "") == "staff"
+        && me().get("role", "") in roles;
+    }
+
+    function isStaff()    { return isActiveStaff(["viewer", "operator", "administrator"]); }
+    function isOperator() { return isActiveStaff(["operator", "administrator"]); }
+    function isAdmin()    { return isActiveStaff(["administrator"]); }
+
+    // ---------------------------------------------------------------
+    // Small helpers
+    // ---------------------------------------------------------------
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function changesOnly(keys) {
+      return incoming().diff(existing()).affectedKeys().hasOnly(keys);
+    }
+    function changes(key) {
+      return incoming().diff(existing()).affectedKeys().hasAny([key]);
+    }
+
+    function validTemp(v)    { return v is number && v >= 30 && v <= 75; }
+    function validMinutes(v) { return v is int && v >= 1 && v <= 720; }
+    function optString(v)    { return v == null || v is string; }
+
+    function runPath(id)   { return /databases/$(database)/documents/dryingRuns/$(id); }
+    function batchPath(id) { return /databases/$(database)/documents/inventory/$(id); }
+    function devicePath()  { return /databases/$(database)/documents/devices/$("SMARTCHIP-ESP32-01"); }
+
+    // ESP32 hasn't sent a heartbeat for 2 minutes.
+    function deviceIsSilent() {
+      let d = get(devicePath()).data;
+      return !("lastSeen" in d) || d.lastSeen == null
+        || d.lastSeen < request.time - duration.value(120, "s");
+    }
+
+    // ---------------------------------------------------------------
+    // users/{uid}
+    // ---------------------------------------------------------------
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      // Public sign-up creates customers only. Staff are created by the
+      // notifier script ("Add staff") or promoted by an administrator.
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && incoming().role == "customer"
+        && incoming().accountType == "customer"
+        && incoming().status in ["active", "pending"];
+
+      allow update: if signedIn() && (
+        // Own profile: anything except role / accountType / status.
+        (
+          request.auth.uid == uid
+          && !incoming().diff(existing()).affectedKeys().hasAny(["role", "accountType", "status"])
+        )
+        ||
+        // Administrator: anyone, but can't change their own role or status.
+        (
+          isAdmin()
+          && incoming().role in ["customer", "viewer", "operator", "administrator"]
+          && incoming().accountType in ["customer", "staff"]
+          && incoming().status in ["active", "inactive", "pending"]
+          && (uid != request.auth.uid
+              || !incoming().diff(existing()).affectedKeys().hasAny(["role", "accountType", "status"]))
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // devices/SMARTCHIP-ESP32-01
+    // ---------------------------------------------------------------
+
+    function validDeviceState() {
+      return incoming().status in ["idle", "setup", "preheating", "drying", "completed", "fault"]
+        && incoming().heater is bool
+        && optString(incoming().get("runId", null))
+        && optString(incoming().get("faultCode", null));
+    }
+
+    function validCommand(c) {
+      return c == null
+        || (
+          c.id is string
+          && c.requestedBy == request.auth.uid
+          && c.requestedAt == request.time
+          && (
+            // START: the run must be created as pending in this same transaction.
+            (
+              c.type == "START"
+              && c.keys().hasOnly(["id", "type", "requestedBy", "requestedAt", "runId", "batchId", "targetTemp", "durationMinutes"])
+              && validTemp(c.targetTemp)
+              && validMinutes(c.durationMinutes)
+              && getAfter(runPath(c.runId)).data.status == "pending"
+              && getAfter(runPath(c.runId)).data.batchId == c.batchId
+            )
+            || (c.type == "STOP" && c.keys().hasOnly(["id", "type", "requestedBy", "requestedAt", "runId"]) && c.runId is string)
+            || (c.type == "CLEAR_FAULT" && c.keys().hasOnly(["id", "type", "requestedBy", "requestedAt"]))
+          )
+        );
+    }
+
+    match /devices/{deviceId} {
+      allow read: if isStaff() || isDevice();
+
+      // The ESP32 creates its own document on first boot.
+      allow create: if isDevice()
+        && deviceId == "SMARTCHIP-ESP32-01"
+        && incoming().get("command", null) == null
+        && validDeviceState();
+
+      // ESP32: its own state, never the command.
+      allow update: if isDevice()
+        && !changes("command")
+        && validDeviceState();
+
+      // Operator: the command field only.
+      allow update: if isOperator()
+        && changesOnly(["command"])
+        && validCommand(incoming().command);
+
+      // Operator: offline recovery once the ESP32 has been silent for 2 min.
+      allow update: if isOperator()
+        && deviceIsSilent()
+        && changesOnly(["status", "runId", "batchId", "source", "targetTemp", "durationMinutes", "remainingSeconds", "heater", "faultCode", "command"])
+        && incoming().status == "idle"
+        && incoming().get("runId", null) == null
+        && incoming().heater == false
+        && incoming().get("command", null) == null;
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // dryingRuns/{runId}
+    // ---------------------------------------------------------------
+
+    match /dryingRuns/{runId} {
+      allow read: if isStaff() || isDevice();
+
+      // Web START: created as pending together with the batch update and command.
+      allow create: if isOperator()
+        && incoming().deviceId == "SMARTCHIP-ESP32-01"
+        && incoming().source == "web"
+        && incoming().status == "pending"
+        && incoming().requestedBy == request.auth.uid
+        && validTemp(incoming().targetTemp)
+        && validMinutes(incoming().durationMinutes)
+        && incoming().batchId is string
+        && getAfter(batchPath(incoming().batchId)).data.status == "Drying"
+        && getAfter(batchPath(incoming().batchId)).data.lastRunId == runId
+        && incoming().startedAt == null
+        && incoming().dryingStartedAt == null
+        && incoming().endedAt == null
+        && incoming().finalWeight == null
+        && incoming().createdAt == request.time;
+
+      // ESP32: run started with the physical buttons.
+      allow create: if isDevice()
+        && incoming().deviceId == "SMARTCHIP-ESP32-01"
+        && incoming().source == "local"
+        && incoming().status in ["preheating", "drying", "completed", "stopped", "failed"]
+        && incoming().batchId == null
+        && incoming().requestedBy == "device"
+        && validTemp(incoming().targetTemp)
+        && validMinutes(incoming().durationMinutes);
+
+      // ESP32: lifecycle of any unfinished run.
+      allow update: if isDevice()
+        && existing().status in ["pending", "preheating", "drying"]
+        && incoming().status in ["preheating", "drying", "completed", "stopped", "failed"]
+        && changesOnly(["status", "startedAt", "dryingStartedAt", "endedAt", "endReason", "faultCode", "updatedAt"]);
+
+      // Operator: cancel a START the ESP32 hasn't accepted, or end a run
+      // whose ESP32 has been silent for 2 minutes (recovery).
+      allow update: if isOperator()
+        && (existing().status == "pending" || (existing().status in ["preheating", "drying"] && deviceIsSilent()))
+        && incoming().status in ["stopped", "failed"]
+        && incoming().endReason in ["cancelled", "recovered"]
+        && changesOnly(["status", "endedAt", "endReason", "updatedAt"]);
+
+      // Operator: record the dried weight of a completed run.
+      allow update: if isOperator()
+        && existing().status == "completed"
+        && changesOnly(["finalWeight", "updatedAt"])
+        && incoming().finalWeight is number
+        && incoming().finalWeight >= 0;
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // inventory/{batchId}   Fresh -> Drying -> Dried -> Archived
+    // ---------------------------------------------------------------
+
+    function validBatchDetails() {
+      return incoming().batchNumber is string
+        && incoming().batchNumber.size() > 0
+        && incoming().batchNumber.size() <= 50
+        && incoming().freshWeight is number
+        && incoming().freshWeight > 0
+        && incoming().harvestDate is string
+        && incoming().harvestDate.size() == 10;
+    }
+
+    match /inventory/{batchId} {
+      allow read: if isStaff() || isDevice();
+
+      allow create: if isOperator()
+        && validBatchDetails()
+        && incoming().status == "Fresh"
+        && incoming().driedWeight == null
+        && incoming().lastRunId == null;
+
+      // Edit a Fresh batch.
+      allow update: if isOperator()
+        && existing().status == "Fresh"
+        && incoming().status == "Fresh"
+        && changesOnly(["batchNumber", "freshWeight", "harvestDate", "updatedAt"])
+        && validBatchDetails();
+
+      // START: Fresh -> Drying, with the new pending run in the same transaction.
+      allow update: if isOperator()
+        && existing().status == "Fresh"
+        && incoming().status == "Drying"
+        && changesOnly(["status", "lastRunId", "updatedAt"])
+        && getAfter(runPath(incoming().lastRunId)).data.status == "pending"
+        && getAfter(runPath(incoming().lastRunId)).data.batchId == batchId;
+
+      // Cancel / recovery: Drying -> Fresh once its run has ended.
+      allow update: if isOperator()
+        && existing().status == "Drying"
+        && incoming().status == "Fresh"
+        && changesOnly(["status", "updatedAt"])
+        && getAfter(runPath(existing().lastRunId)).data.status in ["stopped", "failed"];
+
+      // ESP32: run finished (Dried) or stopped/failed (back to Fresh).
+      allow update: if isDevice()
+        && existing().status == "Drying"
+        && incoming().status in ["Dried", "Fresh"]
+        && changesOnly(["status", "updatedAt"]);
+
+      // Record the weighed dried weight.
+      allow update: if isOperator()
+        && existing().status == "Dried"
+        && incoming().status == "Dried"
+        && changesOnly(["driedWeight", "updatedAt"])
+        && incoming().driedWeight is number
+        && incoming().driedWeight >= 0;
+
+      // Administrator archives a Fresh or Dried batch.
+      allow update: if isAdmin()
+        && existing().status in ["Fresh", "Dried"]
+        && incoming().status == "Archived"
+        && changesOnly(["status", "updatedAt"]);
+
+      allow delete: if false;
+    }
+
+    // ===============================================================
+    // NOTIFICATIONS (sent by the free notifier script, notifier/Code.gs:
+    // web push, Gmail, SMS, Telegram). The script uses the project owner's
+    // Google access, so these rules only limit the web app.
+    //
+    //   settings/notifications   which events go to which channel, who gets
+    //                            what, SMS daily limit (admins edit)
+    //   notifyPrefs/{uid}        each person's own on/off switches + their
+    //                            Telegram chat (they edit; admins can see)
+    //   jobs/{id}                requests for the notifier script: send a test,
+    //                            connect Telegram, add staff (it writes the result)
+    //   pushTokens/{token}       a device that turned on notifications
+    //   notificationLog/{id}     what was sent (written by functions only)
+    //   notifyState/sms          today's SMS count + credits (functions only)
+    // ===============================================================
+
+    function validChannels(c) {
+      return c is map
+        && c.keys().hasOnly(["web", "email", "sms", "telegram"])
+        && c.values().hasOnly([true, false]);
+    }
+
+    function validEventChannels(m) {
+      return m is map
+        && m.keys().hasOnly(["fault", "offline", "runCompleted", "runStartStop", "newOrder"])
+        && (!("fault" in m) || validChannels(m.fault))
+        && (!("offline" in m) || validChannels(m.offline))
+        && (!("runCompleted" in m) || validChannels(m.runCompleted))
+        && (!("runStartStop" in m) || validChannels(m.runStartStop))
+        && (!("newOrder" in m) || validChannels(m.newOrder));
+    }
+
+    match /settings/{docId} {
+      allow read: if docId == "notifications" && isStaff();
+      allow write: if docId == "notifications"
+        && isAdmin()
+        && incoming().keys().hasOnly(["channels", "recipients", "smsDailyLimit", "updatedAt", "updatedBy"])
+        && validEventChannels(incoming().channels)
+        && incoming().recipients is map
+        && incoming().recipients.size() <= 50
+        && incoming().smsDailyLimit is int
+        && incoming().smsDailyLimit >= 0 && incoming().smsDailyLimit <= 100
+        && incoming().updatedAt == request.time
+        && incoming().updatedBy == request.auth.uid;
+    }
+
+    // A person's own switches. The Telegram chat ID is normally saved by the
+    // bot (functions); people may clear it, or type a numeric ID themselves.
+    function validPrefs() {
+      let p = incoming();
+      return p.keys().hasOnly(["web", "email", "sms", "telegram", "telegramChatId", "telegramName", "updatedAt"])
+        && p.get("web", true) is bool
+        && p.get("email", true) is bool
+        && p.get("sms", true) is bool
+        && p.get("telegram", true) is bool
+        && (p.get("telegramChatId", null) == null
+            || (p.telegramChatId is string && p.telegramChatId.matches("^-?[0-9]{5,20}$")))
+        && (p.get("telegramName", null) == null
+            || (p.telegramName is string && p.telegramName.size() <= 80))
+        && p.updatedAt == request.time;
+    }
+
+    match /notifyPrefs/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isAdmin();
+      allow create, update: if isStaff() && request.auth.uid == uid && validPrefs();
+      allow delete: if false;
+    }
+
+    // Document ID = the FCM token. Staff register / remove their own devices.
+    match /pushTokens/{token} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create, update: if isStaff()
+        && incoming().keys().hasOnly(["uid", "token", "userAgent", "createdAt"])
+        && incoming().uid == request.auth.uid
+        && incoming().token == token
+        && incoming().userAgent is string && incoming().userAgent.size() <= 300
+        && incoming().createdAt == request.time;
+      allow delete: if signedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    match /notificationLog/{id} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+
+    match /notifyState/{id} {
+      allow read: if id in ["sms", "status"] && isStaff();
+      allow write: if false;
+    }
+
+    // Staff ask the notifier for something; only the notifier finishes it.
+    match /jobs/{id} {
+      allow read, delete: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isStaff()
+        && incoming().uid == request.auth.uid
+        && incoming().status == "pending"
+        && incoming().createdAt == request.time
+        && (
+          (incoming().type == "test"
+            && incoming().keys().hasOnly(["type", "uid", "status", "createdAt", "channels"])
+            && incoming().channels is list
+            && incoming().channels.size() >= 1 && incoming().channels.size() <= 4
+            && incoming().channels.hasOnly(["web", "email", "sms", "telegram"]))
+          || (incoming().type == "telegramLink"
+            && incoming().keys().hasOnly(["type", "uid", "status", "createdAt", "code"])
+            && incoming().code is string
+            && incoming().code.matches("^[A-Za-z0-9_-]{16,48}$"))
+          || (incoming().type == "addStaff"
+            && isAdmin()
+            && incoming().keys().hasOnly(["type", "uid", "status", "createdAt", "data"])
+            && incoming().data is map
+            && incoming().data.keys().hasOnly(["nickname", "email", "phone", "role"]))
+        );
+      allow update: if false;
+    }
+
+    // ===============================================================
+    // SHOP
+    //
+    //   shop/settings          payment + pickup details (public)
+    //   products/{batchId}     one listing per Dried batch (public when published)
+    //   reservations/{id}      a customer's order
+    //
+    // Stock is reserved atomically: the customer's reservation and the
+    // product's availableGrams decrease are one transaction, and each rule
+    // checks the other side (getAfter), so stock can't be oversold and the
+    // price / grams can't be faked.
+    //
+    // PAY FIRST: a reservation can only be created with a GCash reference
+    // (paymentStatus "submitted"). Only the shop manager marks it "verified",
+    // after checking their GCash history, and only verified orders can be
+    // marked ready or collected. There is no cash on pickup for new orders.
+    // ===============================================================
+
+    // Who runs the shop. Change to isAdmin() if only administrators should.
+    function isShopManager() { return isOperator(); }
+
+    function productPath(id)     { return /databases/$(database)/documents/products/$(id); }
+    function reservationPath(id) { return /databases/$(database)/documents/reservations/$(id); }
+
+    function shortString(v, maxLen) { return v is string && v.size() <= maxLen; }
+
+    match /shop/{docId} {
+      allow read: if docId == "settings";
+      allow write: if isShopManager()
+        && docId == "settings"
+        && incoming().keys().hasOnly(["gcashName", "gcashNumber", "pickupAddress", "pickupHours",
+                                      "contactPhone", "notes", "updatedAt"])
+        && shortString(incoming().get("gcashName", ""), 80)
+        && shortString(incoming().get("gcashNumber", ""), 30)
+        && shortString(incoming().get("pickupAddress", ""), 200)
+        && shortString(incoming().get("pickupHours", ""), 120)
+        && shortString(incoming().get("contactPhone", ""), 30)
+        && shortString(incoming().get("notes", ""), 500);
+    }
+
+    // ---------------------------------------------------------------
+    // products/{batchId}
+    // ---------------------------------------------------------------
+
+    function validPackage(p) {
+      return p is map
+        && p.keys().hasOnly(["grams", "price"])
+        && p.grams is int && p.grams >= 10 && p.grams <= 100000
+        && p.price is number && p.price > 0 && p.price <= 1000000;
+    }
+
+    function validPackages(l) {
+      return l is list && l.size() >= 1 && l.size() <= 4
+        && validPackage(l[0])
+        && (l.size() < 2 || validPackage(l[1]))
+        && (l.size() < 3 || validPackage(l[2]))
+        && (l.size() < 4 || validPackage(l[3]));
+    }
+
+    function validProduct() {
+      let p = incoming();
+      return p.keys().hasOnly(["batchId", "batchNumber", "name", "description", "listedGrams",
+                               "availableGrams", "packages", "published", "lastReservationId",
+                               "createdAt", "updatedAt"])
+        && p.batchNumber is string
+        && p.name is string && p.name.size() >= 1 && p.name.size() <= 80
+        && shortString(p.description, 500)
+        && p.listedGrams is int && p.listedGrams > 0
+        && p.availableGrams is int && p.availableGrams >= 0 && p.availableGrams <= p.listedGrams
+        && validPackages(p.packages)
+        && p.published is bool
+        && p.updatedAt == request.time;
+    }
+
+    // Can't list more than the batch's weighed dried weight (kg -> g).
+    function withinDriedWeight(statuses) {
+      let b = get(batchPath(incoming().batchId)).data;
+      return b.status in statuses
+        && b.get("driedWeight", null) is number
+        && incoming().listedGrams <= b.driedWeight * 1000 + 0.5
+        && incoming().batchNumber == b.batchNumber;
+    }
+
+    // Customer reserve: this write's new reservation took exactly its grams.
+    function reservedNow(productId) {
+      let rid = incoming().lastReservationId;
+      let r = getAfter(reservationPath(rid)).data;
+      return !exists(reservationPath(rid))
+        && r.productId == productId
+        && r.customerId == request.auth.uid
+        && r.status == "reserved"
+        && incoming().availableGrams == existing().availableGrams - r.grams
+        && incoming().availableGrams >= 0;
+    }
+
+    // Customer cancel: stock goes back (capped at the listed amount).
+    function restockedNow(productId) {
+      let rid = incoming().lastReservationId;
+      let before = get(reservationPath(rid)).data;
+      let after = getAfter(reservationPath(rid)).data;
+      let back = existing().availableGrams + before.grams;
+      return before.productId == productId
+        && before.customerId == request.auth.uid
+        && before.status == "reserved"
+        && after.status == "cancelled"
+        && incoming().availableGrams == (back <= existing().listedGrams ? back : existing().listedGrams);
+    }
+
+    match /products/{productId} {
+      // Published listings are public. Signed-in users may also read hidden
+      // ones, so a customer can still cancel a reservation after a listing is hidden.
+      allow read: if resource.data.published == true || signedIn();
+
+      // Publish a Dried batch (document ID = inventory batch ID).
+      allow create: if isShopManager()
+        && incoming().batchId == productId
+        && validProduct()
+        && incoming().availableGrams == incoming().listedGrams
+        && incoming().lastReservationId == null
+        && incoming().createdAt == request.time
+        && withinDriedWeight(["Dried"]);
+
+      // Manager edits: price, packages, amount, publish / hide, restock.
+      allow update: if isShopManager()
+        && incoming().batchId == existing().batchId
+        && incoming().createdAt == existing().createdAt
+        && validProduct()
+        && withinDriedWeight(["Dried", "Archived"]);
+
+      allow update: if signedIn()
+        && existing().published == true
+        && changesOnly(["availableGrams", "lastReservationId", "updatedAt"])
+        && incoming().updatedAt == request.time
+        && reservedNow(productId);
+
+      allow update: if signedIn()
+        && changesOnly(["availableGrams", "lastReservationId", "updatedAt"])
+        && incoming().updatedAt == request.time
+        && restockedNow(productId);
+
+      // Hide (unpublish) instead; reservations point at the product.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // reservations/{id}
+    // ---------------------------------------------------------------
+
+    function isOwnReservation() {
+      return signedIn() && existing().customerId == request.auth.uid;
+    }
+
+    function validNewReservation(rid) {
+      let r = incoming();
+      let p = get(productPath(r.productId)).data;
+      let pAfter = getAfter(productPath(r.productId)).data;
+      let i = r.packageIndex;
+      return r.keys().hasOnly(["productId", "batchId", "batchNumber", "productName", "packageIndex",
+                               "packageGrams", "unitPrice", "quantity", "grams", "total",
+                               "customerId", "customerName", "customerPhone", "customerEmail",
+                               "pickupDate", "note", "status", "paymentMethod", "paymentStatus",
+                               "paymentReference", "paymentSubmittedAt", "paymentVerifiedAt",
+                               "paymentVerifiedBy", "paymentNote", "readyAt", "completedAt",
+                               "cancelledAt", "cancelledBy", "cancelReason", "createdAt", "updatedAt"])
+        && r.customerId == request.auth.uid
+        && p.published == true
+        && r.batchId == p.batchId
+        && r.batchNumber == p.batchNumber
+        && r.productName == p.name
+        && i is int && i >= 0 && i < p.packages.size()
+        && r.quantity is int && r.quantity >= 1 && r.quantity <= 50
+        && r.packageGrams == p.packages[i].grams
+        && r.unitPrice == p.packages[i].price
+        && r.grams == p.packages[i].grams * r.quantity
+        && r.total == p.packages[i].price * r.quantity
+        && r.customerName is string && r.customerName.size() >= 1 && r.customerName.size() <= 80
+        && r.customerPhone is string && r.customerPhone.size() >= 7 && r.customerPhone.size() <= 30
+        && shortString(r.customerEmail, 120)
+        && (r.pickupDate == null || (r.pickupDate is string && r.pickupDate.size() == 10))
+        && shortString(r.note, 300)
+        && r.status == "reserved"
+        && r.paymentMethod == "gcash"
+        && r.paymentStatus == "submitted"
+        && r.paymentReference is string
+        && r.paymentReference.size() >= 4 && r.paymentReference.size() <= 40
+        && r.paymentSubmittedAt == request.time
+        && r.paymentVerifiedAt == null && r.paymentVerifiedBy == null && r.paymentNote == null
+        && r.readyAt == null && r.completedAt == null
+        && r.cancelledAt == null && r.cancelledBy == null && r.cancelReason == null
+        && r.createdAt == request.time && r.updatedAt == request.time
+        // The product's stock went down by exactly this reservation.
+        && pAfter.lastReservationId == rid
+        && pAfter.availableGrams == p.availableGrams - r.grams;
+    }
+
+    match /reservations/{rid} {
+      allow read: if isShopManager()
+        || (signedIn() && resource.data.customerId == request.auth.uid);
+
+      allow create: if signedIn() && validNewReservation(rid);
+
+      // Customer: resend the GCash reference after the farm couldn't find it.
+      allow update: if isOwnReservation()
+        && existing().status in ["reserved", "ready"]
+        && existing().paymentStatus in ["unpaid", "rejected"]
+        && changesOnly(["paymentMethod", "paymentStatus", "paymentReference", "paymentSubmittedAt", "updatedAt"])
+        && incoming().paymentMethod == "gcash"
+        && incoming().paymentStatus == "submitted"
+        && incoming().paymentReference is string
+        && incoming().paymentReference.size() >= 4
+        && incoming().paymentReference.size() <= 40
+        && incoming().paymentSubmittedAt == request.time
+        && incoming().updatedAt == request.time;
+
+      // Customer: cancel only if the farm couldn't find their payment
+      // ("unpaid" = older orders from before pay-first). Stock is returned
+      // in the same write. A paid order is cancelled by the farm (refund).
+      allow update: if isOwnReservation()
+        && existing().status == "reserved"
+        && existing().paymentStatus in ["unpaid", "rejected"]
+        && incoming().status == "cancelled"
+        && changesOnly(["status", "cancelledAt", "cancelledBy", "cancelReason", "updatedAt"])
+        && incoming().cancelledBy == request.auth.uid
+        && incoming().cancelledAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().cancelReason == null || shortString(incoming().cancelReason, 200))
+        && getAfter(productPath(existing().productId)).data.lastReservationId == rid
+        && getAfter(productPath(existing().productId)).data.updatedAt == request.time;
+
+      // Shop manager: verify / reject payment, ready, completed, cancelled.
+      // Ready and completed need a verified payment (old cash orders that are
+      // already "ready" can still be completed, which verifies them).
+      // Cancelling also restocks the product.
+      allow update: if isShopManager()
+        && existing().status in ["reserved", "ready"]
+        && changesOnly(["status", "readyAt", "completedAt", "cancelledAt", "cancelledBy", "cancelReason",
+                        "paymentStatus", "paymentVerifiedAt", "paymentVerifiedBy",
+                        "paymentNote", "updatedAt"])
+        && incoming().status in ["reserved", "ready", "completed", "cancelled"]
+        && incoming().paymentStatus in ["unpaid", "submitted", "verified", "rejected"]
+        && (incoming().status != "completed" || incoming().paymentStatus == "verified")
+        && (incoming().status != "ready" || existing().status == "ready"
+            || incoming().paymentStatus == "verified" || existing().paymentMethod == "cash")
+        && (incoming().paymentNote == null || shortString(incoming().paymentNote, 200))
+        && (incoming().cancelReason == null || shortString(incoming().cancelReason, 200))
+        && incoming().updatedAt == request.time
+        && (incoming().status != "cancelled"
+            || getAfter(productPath(existing().productId)).data.updatedAt == request.time);
+
+      allow delete: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
